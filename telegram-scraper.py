@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 from io import StringIO
 from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage, User, PeerChannel
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage, User, PeerChannel, Channel, Chat
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 import qrcode
 
@@ -43,6 +43,10 @@ class MessageData:
     media_type: Optional[str]
     media_path: Optional[str]
     reply_to: Optional[int]
+    post_author: Optional[str]
+    views: Optional[int]
+    forwards: Optional[int]
+    reactions: Optional[str]
 
 class OptimizedTelegramScraper:
     def __init__(self):
@@ -66,6 +70,7 @@ class OptimizedTelegramScraper:
             'api_id': None,
             'api_hash': None,
             'channels': {},
+            'channel_names': {},
             'scrape_media': True,
         }
 
@@ -80,21 +85,49 @@ class OptimizedTelegramScraper:
         if channel not in self.db_connections:
             channel_dir = Path(channel)
             channel_dir.mkdir(exist_ok=True)
-            
+
             db_file = channel_dir / f'{channel}.db'
             conn = sqlite3.connect(str(db_file), check_same_thread=False)
             conn.execute('''CREATE TABLE IF NOT EXISTS messages
-                          (id INTEGER PRIMARY KEY, message_id INTEGER UNIQUE, date TEXT, 
-                           sender_id INTEGER, first_name TEXT, last_name TEXT, username TEXT, 
-                           message TEXT, media_type TEXT, media_path TEXT, reply_to INTEGER)''')
+                          (id INTEGER PRIMARY KEY, message_id INTEGER UNIQUE, date TEXT,
+                           sender_id INTEGER, first_name TEXT, last_name TEXT, username TEXT,
+                           message TEXT, media_type TEXT, media_path TEXT, reply_to INTEGER,
+                           post_author TEXT, views INTEGER, forwards INTEGER, reactions TEXT)''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_message_id ON messages(message_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON messages(date)')
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
             conn.commit()
+
+            self.migrate_database(conn)
+
             self.db_connections[channel] = conn
-        
+
         return self.db_connections[channel]
+
+    def migrate_database(self, conn: sqlite3.Connection):
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        migrations = []
+        if 'post_author' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN post_author TEXT')
+        if 'views' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN views INTEGER')
+        if 'forwards' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN forwards INTEGER')
+        if 'reactions' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN reactions TEXT')
+
+        for migration in migrations:
+            try:
+                conn.execute(migration)
+            except:
+                pass
+
+        if migrations:
+            conn.commit()
 
     def close_db_connections(self):
         for conn in self.db_connections.values():
@@ -104,16 +137,18 @@ class OptimizedTelegramScraper:
     def batch_insert_messages(self, channel: str, messages: List[MessageData]):
         if not messages:
             return
-            
+
         conn = self.get_db_connection(channel)
-        data = [(msg.message_id, msg.date, msg.sender_id, msg.first_name, 
-                msg.last_name, msg.username, msg.message, msg.media_type, 
-                msg.media_path, msg.reply_to) for msg in messages]
-        
-        conn.executemany('''INSERT OR IGNORE INTO messages 
-                           (message_id, date, sender_id, first_name, last_name, username, 
-                            message, media_type, media_path, reply_to)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', data)
+        data = [(msg.message_id, msg.date, msg.sender_id, msg.first_name,
+                msg.last_name, msg.username, msg.message, msg.media_type,
+                msg.media_path, msg.reply_to, msg.post_author, msg.views,
+                msg.forwards, msg.reactions) for msg in messages]
+
+        conn.executemany('''INSERT OR IGNORE INTO messages
+                           (message_id, date, sender_id, first_name, last_name, username,
+                            message, media_type, media_path, reply_to, post_author, views,
+                            forwards, reactions)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', data)
         conn.commit()
 
     async def download_media(self, channel: str, message) -> Optional[str]:
@@ -195,7 +230,18 @@ class OptimizedTelegramScraper:
             async for message in self.client.iter_messages(entity, offset_id=offset_id, reverse=True):
                 try:
                     sender = await message.get_sender()
-                    
+
+                    reactions_str = None
+                    if message.reactions and message.reactions.results:
+                        reactions_parts = []
+                        for reaction in message.reactions.results:
+                            emoji = getattr(reaction.reaction, 'emoticon', '')
+                            count = reaction.count
+                            if emoji:
+                                reactions_parts.append(f"{emoji} {count}")
+                        if reactions_parts:
+                            reactions_str = ' '.join(reactions_parts)
+
                     msg_data = MessageData(
                         message_id=message.id,
                         date=message.date.strftime('%Y-%m-%d %H:%M:%S'),
@@ -206,9 +252,13 @@ class OptimizedTelegramScraper:
                         message=message.message or '',
                         media_type=message.media.__class__.__name__ if message.media else None,
                         media_path=None,
-                        reply_to=message.reply_to_msg_id if message.reply_to else None
+                        reply_to=message.reply_to_msg_id if message.reply_to else None,
+                        post_author=message.post_author,
+                        views=message.views,
+                        forwards=message.forwards,
+                        reactions=reactions_str
                     )
-                    
+
                     message_batch.append(msg_data)
 
                     if self.state['scrape_media'] and message.media and not isinstance(message.media, MessageMediaWebPage):
@@ -289,14 +339,19 @@ class OptimizedTelegramScraper:
         cursor.execute('SELECT message_id FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND media_path IS NULL')
         message_ids = [row[0] for row in cursor.fetchall()]
 
+        channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+
         if not message_ids:
-            print(f"No media files to reprocess for channel {channel}")
+            print(f"No media files to reprocess for {channel_name} (ID: {channel})")
             return
 
-        print(f"📥 Reprocessing {len(message_ids)} media files for channel {channel}")
+        print(f"📥 Reprocessing {len(message_ids)} media files for {channel_name} (ID: {channel})")
 
         try:
-            entity = await self.client.get_entity(PeerChannel(int(channel)))
+            if channel.lstrip('-').isdigit():
+                entity = await self.client.get_entity(PeerChannel(int(channel)))
+            else:
+                entity = await self.client.get_entity(channel)
             semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
             completed_media = 0
             successful_downloads = 0
@@ -339,35 +394,39 @@ class OptimizedTelegramScraper:
     async def fix_missing_media(self, channel: str):
         conn = self.get_db_connection(channel)
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage"')
         total_with_media = cursor.fetchone()[0]
-        
+
         cursor.execute('SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND media_path IS NOT NULL')
         total_with_files = cursor.fetchone()[0]
-        
+
         missing_count = total_with_media - total_with_files
-        
-        print(f"\n📊 Media Analysis for {channel}:")
+
+        channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+        print(f"\n📊 Media Analysis for {channel_name} (ID: {channel}):")
         print(f"Messages with media: {total_with_media}")
         print(f"Media files downloaded: {total_with_files}")
         print(f"Missing media files: {missing_count}")
-        
+
         if missing_count == 0:
             print("✅ All media files are already downloaded!")
             return
-            
+
         cursor.execute('SELECT message_id, media_type FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND (media_path IS NULL OR media_path = "")')
         missing_media = cursor.fetchall()
-        
+
         if not missing_media:
             print("✅ No missing media found!")
             return
 
         print(f"\n🔧 Attempting to download {len(missing_media)} missing media files...")
-        
+
         try:
-            entity = await self.client.get_entity(PeerChannel(int(channel)))
+            if channel.lstrip('-').isdigit():
+                entity = await self.client.get_entity(PeerChannel(int(channel)))
+            else:
+                entity = await self.client.get_entity(channel)
             semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
             completed_media = 0
             successful_downloads = 0
@@ -432,18 +491,23 @@ class OptimizedTelegramScraper:
         finally:
             self.continuous_scraping_active = False
 
+    def get_export_filename(self, channel: str):
+        username = self.state.get('channel_names', {}).get(channel, 'no_username')
+        return f"{channel}_{username}"
+
     def export_to_csv(self, channel: str):
         conn = self.get_db_connection(channel)
-        csv_file = Path(channel) / f'{channel}.csv'
-        
+        filename = self.get_export_filename(channel)
+        csv_file = Path(channel) / f'{filename}.csv'
+
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM messages ORDER BY date')
         columns = [description[0] for description in cursor.description]
-        
+
         with open(csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(columns)
-            
+
             while True:
                 rows = cursor.fetchmany(1000)
                 if not rows:
@@ -452,30 +516,31 @@ class OptimizedTelegramScraper:
 
     def export_to_json(self, channel: str):
         conn = self.get_db_connection(channel)
-        json_file = Path(channel) / f'{channel}.json'
-        
+        filename = self.get_export_filename(channel)
+        json_file = Path(channel) / f'{filename}.json'
+
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM messages ORDER BY date')
         columns = [description[0] for description in cursor.description]
-        
+
         with open(json_file, 'w', encoding='utf-8') as f:
             f.write('[\n')
             first_row = True
-            
+
             while True:
                 rows = cursor.fetchmany(1000)
                 if not rows:
                     break
-                
+
                 for row in rows:
                     if not first_row:
                         f.write(',\n')
                     else:
                         first_row = False
-                    
+
                     data = dict(zip(columns, row))
                     json.dump(data, f, ensure_ascii=False, indent=2)
-            
+
             f.write('\n]')
 
     async def export_data(self):
@@ -496,7 +561,7 @@ class OptimizedTelegramScraper:
         if not self.state['channels']:
             print("No channels saved")
             return
-        
+
         print("\nCurrent channels:")
         for i, (channel, last_id) in enumerate(self.state['channels'].items(), 1):
             try:
@@ -504,20 +569,45 @@ class OptimizedTelegramScraper:
                 cursor = conn.cursor()
                 cursor.execute('SELECT COUNT(*) FROM messages')
                 count = cursor.fetchone()[0]
-                print(f"[{i}] Channel ID: {channel}, Last Message ID: {last_id}, Messages: {count}")
+                channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                print(f"[{i}] {channel_name} (ID: {channel}), Last Message ID: {last_id}, Messages: {count}")
             except:
-                print(f"[{i}] Channel ID: {channel}, Last Message ID: {last_id}")
+                channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                print(f"[{i}] {channel_name} (ID: {channel}), Last Message ID: {last_id}")
 
     async def list_channels(self):
         try:
-            print("\nList of channels joined by account:")
+            print("\nList of channels and groups joined by account:")
             count = 1
+            channels_data = []
             async for dialog in self.client.iter_dialogs():
-                if dialog.id != 777000:
-                    print(f"[{count}] {dialog.title} (id: {dialog.id})")
+                entity = dialog.entity
+                if dialog.id != 777000 and (isinstance(entity, Channel) or isinstance(entity, Chat)):
+                    channel_type = "Channel" if isinstance(entity, Channel) and entity.broadcast else "Group"
+                    username = getattr(entity, 'username', None) or 'no_username'
+                    print(f"[{count}] {dialog.title} (ID: {dialog.id}, Type: {channel_type}, Username: @{username})")
+                    channels_data.append({
+                        'number': count,
+                        'channel_name': dialog.title,
+                        'channel_id': str(dialog.id),
+                        'username': username,
+                        'type': channel_type
+                    })
                     count += 1
+
+            if channels_data:
+                csv_file = Path('channels_list.csv')
+                with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['number', 'channel_name', 'channel_id', 'username', 'type'])
+                    writer.writeheader()
+                    writer.writerows(channels_data)
+                print(f"\n✅ Saved channels list to {csv_file}")
+
+            return channels_data
+
         except Exception as e:
             print(f"Error listing channels: {e}")
+            return []
 
     def display_qr_code_ascii(self, qr_login):
         qr = qrcode.QRCode(box_size=1, border=1)
@@ -736,44 +826,66 @@ class OptimizedTelegramScraper:
                     await self.export_data()
                     
                 elif choice == 'l':
-                    channels_list = []
-                    async for dialog in self.client.iter_dialogs():
-                        if dialog.id != 777000:
-                            channels_list.append(str(dialog.id))
-                    
-                    await self.list_channels()
+                    channels_data = await self.list_channels()
+
+                    if not channels_data:
+                        continue
+
                     print("\nTo add channels from the list above:")
                     print("• Single: 1 or -1001234567890")
                     print("• Multiple: 1,3,5 or mix formats")
+                    print("• All channels: all")
                     print("• Press Enter to skip adding")
                     selection = input("\nEnter selection (or Enter to skip): ").strip()
-                    
+
                     if selection:
                         added_count = 0
-                        for sel in [x.strip() for x in selection.split(',')]:
-                            try:
-                                if sel.startswith('-'):
-                                    channel = sel
-                                else:
-                                    num = int(sel)
-                                    if 1 <= num <= len(channels_list):
-                                        channel = channels_list[num - 1]
-                                    else:
-                                        print(f"Invalid number: {num}. Choose 1-{len(channels_list)}")
-                                        continue
-                                
-                                if channel in self.state['channels']:
-                                    print(f"Channel {channel} already added")
-                                else:
-                                    self.state['channels'][channel] = 0
-                                    self.save_state()
-                                    print(f"✅ Added channel {channel}")
+
+                        if selection.lower() == 'all':
+                            for channel_info in channels_data:
+                                channel_id = channel_info['channel_id']
+                                if channel_id not in self.state['channels']:
+                                    self.state['channels'][channel_id] = 0
+                                    if 'channel_names' not in self.state:
+                                        self.state['channel_names'] = {}
+                                    self.state['channel_names'][channel_id] = channel_info['username']
+                                    print(f"✅ Added channel {channel_info['channel_name']} (ID: {channel_id})")
                                     added_count += 1
-                                    
-                            except ValueError:
-                                print(f"Invalid input: {sel}")
-                        
+                                else:
+                                    print(f"Channel {channel_info['channel_name']} already added")
+                        else:
+                            for sel in [x.strip() for x in selection.split(',')]:
+                                try:
+                                    if sel.startswith('-'):
+                                        channel_id = sel
+                                        channel_info = next((c for c in channels_data if c['channel_id'] == channel_id), None)
+                                        if not channel_info:
+                                            print(f"Channel ID {channel_id} not found")
+                                            continue
+                                    else:
+                                        num = int(sel)
+                                        if 1 <= num <= len(channels_data):
+                                            channel_info = channels_data[num - 1]
+                                            channel_id = channel_info['channel_id']
+                                        else:
+                                            print(f"Invalid number: {num}. Choose 1-{len(channels_data)}")
+                                            continue
+
+                                    if channel_id in self.state['channels']:
+                                        print(f"Channel {channel_info['channel_name']} already added")
+                                    else:
+                                        self.state['channels'][channel_id] = 0
+                                        if 'channel_names' not in self.state:
+                                            self.state['channel_names'] = {}
+                                        self.state['channel_names'][channel_id] = channel_info['username']
+                                        print(f"✅ Added channel {channel_info['channel_name']} (ID: {channel_id})")
+                                        added_count += 1
+
+                                except ValueError:
+                                    print(f"Invalid input: {sel}")
+
                         if added_count > 0:
+                            self.save_state()
                             print(f"\n🎉 Added {added_count} new channel(s)!")
                             await self.view_channels()
                         else:

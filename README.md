@@ -11,41 +11,39 @@ ___________________  _________
                  \/        \/
 ```
 
-## What's New in v3.0 🎉
+## What's New in v3.1 🎉
 
-**QR Code Authentication:**
-- **No phone number required** - Login with QR code scanning (still need API credentials)
-- **Faster authentication** - Just scan with your phone after API setup
-- **Secure login** - Recommended authentication method
-- **2FA support** for both QR and phone methods
+**Enhanced Message Data:**
+- **Message statistics** - Captures views, forwards, and post_author for each message
+- **Reactions support** - Records all emoji reactions with counts (e.g., "😀 12 👍 3")
+- **Automatic database migration** - Seamlessly adds new columns to existing databases
+- **Richer exports** - All new data included in CSV/JSON exports
 
-**Enhanced User Experience:**
-- **Numbered channel selection** - Use 1,2,3 instead of full channel IDs
-- **Multi-channel operations** - Add, remove, and scrape multiple channels at once
-- **Streamlined menu** - Cleaner interface with fewer redundant options
-- **Progress bars** for media downloads with visual feedback
+**Improved Channel Management:**
+- **Channel names displayed** - Shows channel names alongside IDs everywhere
+- **Smart filtering** - List option now only shows Channels and Groups (no private chats)
+- **channels_list.csv export** - Automatically saves channel list with names, IDs, usernames, and types
+- **"all" selection** - Quickly add all listed channels at once
+- **Better export naming** - Files now named as `ID_username.csv` and `ID_username.json`
 
-**Media Download Improvements:**
-- **Fixed file overwriting** - Unique naming prevents media files from being overwritten
-- **5x concurrent downloads** - Increased from 3 to 5 for faster media processing
-- **Better error handling** - Improved retry logic and recovery
-
-**Performance & Stability:**
-- **Database optimizations** - WAL mode and faster operations
-- **Hidden warnings** - Cleaner output without technical messages
-- **Better error recovery** - More robust handling of network issues
+**Bug Fixes:**
+- **Fixed channel ID parsing** - Resolved "invalid literal for int()" error in fix missing media
+- **Better entity resolution** - Handles both numeric IDs and channel usernames
+- **Improved error messages** - Shows channel names with IDs for clearer debugging
 
 ## Features 🚀
 
 - **QR Code & Phone Authentication** - Choose your preferred login method
-- Scrape messages from multiple Telegram channels
+- Scrape messages with full metadata (views, forwards, reactions, post author)
 - Download media files with parallel processing and unique naming
 - Real-time continuous scraping
-- Export data to JSON and CSV formats
-- SQLite database storage with optimized performance
+- Export data to JSON and CSV formats with enhanced metadata
+- SQLite database storage with automatic schema migration
 - Resume capability (saves progress)
-- Interactive menu with numbered channel selection
+- Interactive menu with channel names and numbered selection
+- Smart channel filtering (only shows channels/groups)
 - Progress tracking with visual progress bars
+- Automatic channels list export to CSV
 
 ## Prerequisites 📋
 
@@ -128,16 +126,23 @@ Instead of typing long channel IDs, use numbers:
 
 **Adding Channels:**
 ```
-[1] The News (Chat) (id: -1002116176890)
-[2] Python Channel (id: -1001597139842)
-[3] The Corner (id: -1002274713954)
+[1] Tech News (ID: -1002116176890, Type: Channel, Username: @technews)
+[2] Python Dev (ID: -1001597139842, Type: Group, Username: @pythondev)
+[3] Daily Updates (ID: -1002274713954, Type: Channel, Username: @dailyupdates)
 
 Enter: 1,3 (adds channels 1 and 3)
+Or: all (adds all listed channels)
+```
+
+**Viewing Your Channels:**
+```
+[1] Tech News (ID: -1002116176890), Last Message ID: 5234, Messages: 12450
+[2] Python Dev (ID: -1001597139842), Last Message ID: 8192, Messages: 45782
 ```
 
 **Scraping Channels:**
 - Single: `1`
-- Multiple: `1,3,5` 
+- Multiple: `1,3,5`
 - All: `all`
 - Mix formats: `1,-1001597139842,3`
 
@@ -149,6 +154,8 @@ Data is stored in SQLite databases, one per channel:
 - Location: `./channelname/channelname.db`
 - Optimized with indexes for fast queries
 - WAL mode for better performance
+- Schema includes: message_id, date, sender info, message text, media info, reply_to, post_author, views, forwards, reactions
+- Automatic migration adds new columns to existing databases
 
 ### Media Storage 📁
 
@@ -160,8 +167,11 @@ Media files are stored with unique naming:
 ### Exported Data 📊
 
 Export formats:
-1. **CSV**: `./channelname/channelname.csv`
-2. **JSON**: `./channelname/channelname.json`
+1. **CSV**: `./channelname/channelid_username.csv`
+2. **JSON**: `./channelname/channelid_username.json`
+3. **Channel List**: `./channels_list.csv` (automatically created when using [L] option)
+
+All exports include complete message metadata: views, forwards, reactions, and post author information.
 
 ## Performance Features ⚙️
 
